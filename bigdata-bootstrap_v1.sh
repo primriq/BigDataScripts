@@ -92,113 +92,87 @@ feature_tick(){ _feat_done=$((_feat_done+1)); progress_line "progress…"; }
 feature_end(){ _feat_done="$_feat_total"; progress_line "done"; CURRENT_STEP=$((CURRENT_STEP+1)); }
 
 # ---- Mirrors & downloads (stronger checksum parsing + aria2 fallback) ----
-apache_urls(){  # $1=project path after /dist/, $2=filename
-  local p="$1" f="$2"
-  echo "https://archive.apache.org/dist/${p}/${f} \
-https://mirrors.ocf.berkeley.edu/apache/${p}/${f} \
-https://dlcdn.apache.org/${p}/${f} \
-https://ftp.jaist.ac.jp/pub/apache/${p}/${f} \
-https://mirrors.piconets.webwerks.in/apachemirror/${p}/${f}"
-}
 
-# checksum suffixes to try and mapping to verifier
+# ---- Mirrors & downloads ----
+# (patched to handle unbound variables and flaky networks)
+
+# checksum suffixes and mapping to sum binaries
 CHECKSUMS=(".sha512" ".sha256" ".sha1" ".md5")
 declare -A SUMBIN
-SUMBIN[.sha512]=sha512sum
-SUMBIN[.sha256]=sha256sum
-SUMBIN[.sha1]=sha1sum
-SUMBIN[.md5]=md5sum
+SUMBIN[".sha512"]="sha512sum"
+SUMBIN[".sha256"]="sha256sum"
+SUMBIN[".sha1"]="sha1sum"
+SUMBIN[".md5"]="md5sum"
 
 # helper: test remote existence (HEAD)
 remote_exists(){ curl -sI --max-time 8 "$1" | head -n 1 | grep -q "200"; }
 
-# check if aria2c is available
+# aria2 fallback detection
 ARIA2_AVAILABLE=false
 if command -v aria2c >/dev/null 2>&1; then ARIA2_AVAILABLE=true; fi
 
-# download a single URL using wget, fallback to aria2c if available and wget fails
-_download_url(){ local url="$1" outpart="$2"; if wget --inet4-only --progress=dot:giga -t 2 --timeout=25 "$url" -O "$outpart"; then return 0; fi
-  if $ARIA2_AVAILABLE; then msg "wget failed — trying aria2c for $url"; aria2c -x16 -s16 -k1M -o "$(basename "$outpart")" "$url" -d "$(dirname "$outpart")" && mv -f "$(dirname "$outpart")/$(basename "$outpart")" "$outpart" && return 0; fi
-  return 1; }
-
-# robust checksum verifier: accepts checksum file content and the local filename
-verify_with_checksum_file(){ local sumfile="$1" local target="$2" local suf="${sumfile##*.}"
-  # choose appropriate sum binary by suffix (map .sha512 etc.)
-  local bin=""
-  for k in "${!SUMBIN[@]}"; do if [[ "$sumfile" == *"$k" ]]; then bin="${SUMBIN[$k]}"; fi; done
-  # fallback: detect by length
-  if [ -z "$bin" ]; then
-    case $(wc -c <"$sumfile") in
-      * ) bin=sha512sum ;;
-    esac
+# download helper: try wget, then aria2c
+_download_url(){ local url="$1" out="$2"
+  if wget --inet4-only --progress=dot:giga -t 2 --timeout=25 "$url" -O "$out"; then
+    return 0
   fi
-  # normalize checksum file: if it contains a single hash (no filename), map it to target
-  if awk 'NR>0{print}' "$sumfile" | grep -q ' '; then
-    # already in 'hash  filename' format — try direct check
-    $bin -c "$sumfile" >/dev/null 2>&1 && return 0 || return 1
-  else
-    HASH=$(awk '{print $1}' "$sumfile" 2>/dev/null || true)
-    if [ -n "$HASH" ]; then
-      echo "$HASH  $(basename "$target")" > "${sumfile}.tmp"
-      $bin -c "${sumfile}.tmp" >/dev/null 2>&1 && rm -f "${sumfile}.tmp" && return 0 || { rm -f "${sumfile}.tmp"; return 1; }
-    fi
+  if $ARIA2_AVAILABLE; then
+    msg "wget failed — trying aria2c for $url"
+    aria2c -x16 -s16 -k1M -o "$(basename "$out")" "$url" -d "$(dirname "$out")" >/dev/null 2>&1 && \
+      mv -f "$(dirname "$out")/$(basename "$out")" "$out" && return 0
   fi
   return 1
 }
 
-fetch_tarball(){  # $1=space-separated URLs, $2=outfile
-  local urls="$1" out="$2" ok=""
-  rm -f "$out.part" 2>/dev/null || true
-  ensure_dir "$CACHE_DIR"
+# normalize and verify checksum file content against target file
+verify_with_checksum_file(){
+  local sumfile="$1" target="$2"
+  [ -f "$sumfile" ] || return 1
+  local suf="" bin=""
+  for k in "${!SUMBIN[@]}"; do [[ "$sumfile" == *"$k" ]] && suf="$k" && bin="${SUMBIN[$k]}" && break; done
+  [ -z "$bin" ] && bin="sha512sum"
+  if grep -q '[[:space:]]' "$sumfile"; then
+    if $bin -c "$sumfile" >/dev/null 2>&1; then return 0; fi
+  fi
+  local tmpf
+  tmpf="$(mktemp)"
+  awk '{print $1}' "$sumfile" | head -n1 | awk -v name="$(basename "$target")" '{print $1 "  " name}' > "$tmpf"
+  if $bin -c "$tmpf" >/dev/null 2>&1; then rm -f "$tmpf"; return 0; fi
+  rm -f "$tmpf"
+  return 1
+}
 
-  # use cache if present
-  if [ -f "$CACHE_DIR/$out" ]; then
-    msg "Using cached $CACHE_DIR/$out"
-    cp "$CACHE_DIR/$out" "$out"
-    if tar -tf "$out" >/dev/null 2>&1; then ok="yes"; else rm -f "$out"; warn "Cached archive invalid, re-downloading"; fi
+# main fetch: accepts space-separated URLs and an output filename
+fetch_tarball(){ local urls="$1" out="$2" ok=""
+  rm -f "$out.part" 2>/dev/null || true
+  ensure_dir "${CACHE_DIR:-$HOME/bigdata-cache}"
+  if [ -n "${CACHE_DIR:-}" ] && [ -f "${CACHE_DIR}/$out" ]; then
+    msg "Using cached ${CACHE_DIR}/$out"
+    cp "${CACHE_DIR}/$out" "$out"
+    if tar -tf "$out" >/dev/null 2>&1; then ok="yes"; fi
+    [ -z "$ok" ] && rm -f "$out"
   fi
 
   for u in $urls; do
     [ -n "$ok" ] && break
     echo "→ trying $u"
     if _download_url "$u" "$out.part"; then
-      # try to find checksum companion files in multiple naming conventions
-      found_checksum=""
+      local found_checksum=""
       for suf in "${CHECKSUMS[@]}"; do
-        # common variants:
-        # 1) <url><suf>  (e.g. file.tar.gz.sha512)
-        # 2) <url>.sha512 (same as above) handled by 1
-        # 3) <dir>/<file><suf> (same as 1)
         if remote_exists "${u}${suf}"; then
-          msg "Found checksum at ${u}${suf} — downloading"
-          wget --inet4-only --progress=dot:giga -t 2 --timeout=10 "${u}${suf}" -O "${out}.part${suf}" 2>/dev/null || true
-          if [ -f "${out}.part${suf}" ] && verify_with_checksum_file "${out}.part${suf}" "$out.part"; then
-            found_checksum="${out}.part${suf}"; break
-          else
-            rm -f "${out}.part${suf}" 2>/dev/null || true
-          fi
+          local chkfile
+          chkfile="$(mktemp)"
+          wget --inet4-only -q -t 2 --timeout=10 "${u}${suf}" -O "$chkfile" || rm -f "$chkfile" && continue
+          if verify_with_checksum_file "$chkfile" "$out.part"; then found_checksum="$chkfile"; fi
+          [ -z "$found_checksum" ] || break
+          rm -f "$chkfile"
         fi
-        # 4) some mirrors provide checksums in file named <file>-checksums.txt or in SHA*.txt — attempt common patterns
-        base_dir="$(dirname "$u")/"
-        fname="$(basename "$u")"
-        for alt in "${fname}${suf}" "${fname}${suf}.txt" "${fname}-checksums.txt" "${fname}.sha512.txt"; do
-          if remote_exists "${base_dir}${alt}"; then
-            msg "Found checksum at ${base_dir}${alt} — downloading"
-            wget --inet4-only --progress=dot:giga -t 2 --timeout=10 "${base_dir}${alt}" -O "${out}.part${suf}.alt" 2>/dev/null || true
-            if [ -f "${out}.part${suf}.alt" ] && verify_with_checksum_file "${out}.part${suf}.alt" "$out.part"; then
-              found_checksum="${out}.part${suf}.alt"; break 2
-            else
-              rm -f "${out}.part${suf}.alt" 2>/dev/null || true
-            fi
-          fi
-        done
       done
 
       if [ -n "$found_checksum" ]; then
-        mv -f "$out.part" "$out"; ok="yes"; rm -f "$found_checksum" 2>/dev/null || true; break
+        mv -f "$out.part" "$out"; ok="yes"; rm -f "$found_checksum" || true; break
       fi
 
-      # fallback: tar integrity
       if tar -tf "$out.part" >/dev/null 2>&1; then
         mv -f "$out.part" "$out"; ok="yes"; break
       else
@@ -208,24 +182,36 @@ fetch_tarball(){  # $1=space-separated URLs, $2=outfile
       echo "Download failed from this mirror, next…"
     fi
   done
-
   [ -n "$ok" ] || { rm -f "$out.part"; die "Download failed: $out (all mirrors)"; }
-
-  # cache successful download
-  cp -f "$out" "$CACHE_DIR/$out" || true
+  if [ -n "${CACHE_DIR:-}" ]; then
+    ensure_dir "$CACHE_DIR"
+    cp -f "$out" "$CACHE_DIR/$out" || true
+  fi
 }
 
-fetch_apache_tar_into(){  # $1=project path after /dist/, $2=filename, $3=target_dir, $4=expected_unpacked (optional)
+# fetch from Apache mirrors
+apache_urls(){  
+  local p="$1" f="$2"
+  echo "https://archive.apache.org/dist/${p}/${f} \
+https://mirrors.ocf.berkeley.edu/apache/${p}/${f} \
+https://dlcdn.apache.org/${p}/${f} \
+https://ftp.jaist.ac.jp/pub/apache/${p}/${f} \
+https://mirrors.piconets.webwerks.in/apachemirror/${p}/${f}"
+}
+
+fetch_apache_tar_into(){  
   local proj="$1" file="$2" name="$3" expect
   if [ -n "${4-}" ]; then expect="$4"; else expect="${file%.tar.*}"; fi
   feature_tick; fetch_tarball "$(apache_urls "$proj" "$file")" "$file"
   feature_tick; tar -xf "$file"
   feature_tick; mv -f "$expect" "$name" 2>/dev/null || true
 }
-fetch_file(){  # Maven Central etc.
+
+fetch_file(){  
   local url="$1" out="$2"
   feature_tick; wget --inet4-only --progress=dot:giga -t 3 --timeout=25 "$url" -O "$out" 2>&1 || die "Download failed: $url"
 }
+
 
 # ---- Preflight ----
 preflight(){
