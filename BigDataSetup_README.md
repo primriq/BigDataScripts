@@ -107,7 +107,7 @@ newgrp sudo
 Move to your home directory and download the script:
 ```bash
 cd ~
-wget https://raw.githubusercontent.com/primriq/BigDataScripts/refs/heads/main/bigdata-bootstrap.sh -O bigdata-bootstrap.sh
+wget https://raw.githubusercontent.com/primriq/BigDataScripts/refs/heads/main/bigdata-bootstrap_v1.sh -O bigdata-bootstrap.sh
 chmod +x bigdata-bootstrap.sh
 ```
 
@@ -117,7 +117,7 @@ chmod +x bigdata-bootstrap.sh
 
 Run the setup script with logging enabled:
 ```bash
-./bigdata-bootstrap.sh 2>&1 | tee bigdata-bootstrap.log
+./bigdata-bootstrap.sh  | tee bigdata-bootstrap.log
 ```
 
 The script will:
